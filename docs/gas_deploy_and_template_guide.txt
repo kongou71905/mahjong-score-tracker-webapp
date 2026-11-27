@@ -1,0 +1,657 @@
+========================================================================
+麻雀成績管理アプリ：GASデプロイ・テンプレート配布手順書
+========================================================================
+
+本手順書は、作成済みのGoogleスプレッドシートに対して
+Google Apps Script（GAS）を設定・Webアプリとして公開（デプロイ）し、
+アプリと接続・他メンバーへテンプレート配布するための手順書です。
+別のパソコン上で以下の手順に沿って設定してください。
+
+
+------------------------------------------------------------------------
+1. Apps Script エディタを開く
+------------------------------------------------------------------------
+(1) 先に作成したGoogleスプレッドシートを開きます。
+    （4つのシート：Players / DailyRecords / GameDetails / Settings
+      が作成済みであることを確認してください）
+
+(2) スプレッドシート上部のメニューから
+    「拡張機能」＞「Apps Script」をクリックします。
+
+(3) 新しいタブで Apps Script エディタが開いたら、左上のプロジェクト名
+    （「無題のプロジェクト」）をクリックし、分かりやすい名前に変更します。
+    例：麻雀成績管理_GAS
+
+
+------------------------------------------------------------------------
+2. GASコード（コード.gs）の貼り付けと保存
+------------------------------------------------------------------------
+(1) エディタ内の「コード.gs」に最初から書かれている
+    「function myFunction() { ... }」をすべて選択して削除します。
+
+(2) 下の「===== ここからコピー =====」〜「===== ここまでコピー =====」
+    の間のコードをすべてコピーし、「コード.gs」に貼り付けます。
+
+===== ここからコピー =====
+const API_VERSION = '1.0';
+
+const SHEET_NAMES = {
+  PLAYERS: 'Players',
+  DAILY_RECORDS: 'DailyRecords',
+  GAME_DETAILS: 'GameDetails',
+  SETTINGS: 'Settings',
+};
+
+const DEFAULT_SETTINGS = [
+  { setting_key: 'game_type', setting_value: 'hanchan' },
+  { setting_key: 'starting_points', setting_value: '25000' },
+  { setting_key: 'return_points', setting_value: '30000' },
+  { setting_key: 'uma_pattern', setting_value: '10-20' },
+  { setting_key: 'use_tobi', setting_value: 'true' },
+  { setting_key: 'tobi_busted_point', setting_value: '-5' },
+  { setting_key: 'tobi_flyer_point', setting_value: '5' },
+  { setting_key: 'use_yakitori', setting_value: 'true' },
+  { setting_key: 'use_chip', setting_value: 'true' },
+  { setting_key: 'chip_rate', setting_value: '2' },
+  { setting_key: 'use_settlement', setting_value: 'true' },
+  { setting_key: 'settlement_rate', setting_value: '50' },
+];
+
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      throw new Error('リクエストボディが空です。');
+    }
+    const req = JSON.parse(e.postData.contents);
+    const action = req.action;
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    if (action === 'testConnection') {
+      return jsonResponse_({
+        status: 'ok',
+        apiVersion: API_VERSION,
+      });
+    }
+
+    if (action === 'getInitialData') {
+      const data = getInitialData_(ss);
+      return jsonResponse_({
+        status: 'ok',
+        apiVersion: API_VERSION,
+        players: data.players,
+        daily_records: data.daily_records,
+        game_details: data.game_details,
+        settings: data.settings,
+      });
+    }
+
+    // 書き込み系アクションは排他制御（ScriptLock）を適用
+    const lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    try {
+      if (action === 'saveSettings') {
+        const settings = saveSettings_(ss, req.settings || []);
+        return jsonResponse_({
+          status: 'ok',
+          apiVersion: API_VERSION,
+          settings: settings,
+        });
+      }
+
+      if (action === 'savePlayers') {
+        const players = savePlayers_(ss, req.players || []);
+        return jsonResponse_({
+          status: 'ok',
+          apiVersion: API_VERSION,
+          players: players,
+        });
+      }
+
+      if (action === 'saveSession') {
+        const skipped = saveSession_(ss, req);
+        return jsonResponse_({
+          status: 'ok',
+          apiVersion: API_VERSION,
+          skipped: skipped,
+        });
+      }
+
+      if (action === 'updateSession') {
+        updateSession_(ss, req);
+        return jsonResponse_({
+          status: 'ok',
+          apiVersion: API_VERSION,
+        });
+      }
+
+      if (action === 'deleteSession') {
+        deleteSession_(ss, req.session_id);
+        return jsonResponse_({
+          status: 'ok',
+          apiVersion: API_VERSION,
+        });
+      }
+
+      throw new Error('未対応のアクションです: ' + action);
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    return jsonResponse_({
+      status: 'error',
+      apiVersion: API_VERSION,
+      message: err && err.message ? err.message : String(err),
+    });
+  }
+}
+
+function jsonResponse_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(
+    ContentService.MimeType.JSON
+  );
+}
+
+function getSheetOrThrow_(ss, name) {
+  const sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    throw new Error('シート「' + name + '」が見つかりません。');
+  }
+  return sheet;
+}
+
+function getDataRows_(sheet) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow <= 1 || lastCol === 0) return [];
+  return sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+}
+
+function formatDateCell_(val, tz) {
+  if (val instanceof Date) {
+    return Utilities.formatDate(val, tz, 'yyyy/MM/dd');
+  }
+  return String(val === null || val === undefined ? '' : val);
+}
+
+function formatDateTimeCell_(val, tz) {
+  if (val instanceof Date) {
+    return Utilities.formatDate(val, tz, 'yyyy/MM/dd HH:mm:ss');
+  }
+  return String(val === null || val === undefined ? '' : val);
+}
+
+function formatNow_(tz) {
+  return Utilities.formatDate(new Date(), tz, 'yyyy/MM/dd HH:mm:ss');
+}
+
+function toBoolean_(val) {
+  return val === true || String(val).trim().toUpperCase() === 'TRUE';
+}
+
+function appendRowsFormatted_(sheet, rows, textColIndexes1Based) {
+  if (!rows || rows.length === 0) return;
+  const startRow = sheet.getLastRow() + 1;
+  const numRows = rows.length;
+  const numCols = rows[0].length;
+  for (let i = 0; i < textColIndexes1Based.length; i++) {
+    const col = textColIndexes1Based[i];
+    sheet.getRange(startRow, col, numRows, 1).setNumberFormat('@');
+  }
+  sheet.getRange(startRow, 1, numRows, numCols).setValues(rows);
+}
+
+function getInitialData_(ss) {
+  const tz = ss.getSpreadsheetTimeZone();
+
+  const playersSheet = getSheetOrThrow_(ss, SHEET_NAMES.PLAYERS);
+  const dailySheet = getSheetOrThrow_(ss, SHEET_NAMES.DAILY_RECORDS);
+  const detailsSheet = getSheetOrThrow_(ss, SHEET_NAMES.GAME_DETAILS);
+  const settingsSheet = getSheetOrThrow_(ss, SHEET_NAMES.SETTINGS);
+
+  const players = getDataRows_(playersSheet)
+    .filter((r) => String(r[0] || '').trim() !== '')
+    .map((r) => ({
+      player_id: String(r[0]),
+      name: String(r[1] || ''),
+      is_active: toBoolean_(r[2]),
+      created_at: formatDateTimeCell_(r[3], tz),
+    }));
+
+  const daily_records = getDataRows_(dailySheet)
+    .filter((r) => String(r[0] || '').trim() !== '')
+    .map((r) => ({
+      session_id: String(r[0]),
+      date: formatDateCell_(r[1], tz),
+      player_id: String(r[2] || ''),
+      player_name: String(r[3] || ''),
+      game_count: Number(r[4]) || 0,
+      chip_diff: Number(r[5]) || 0,
+      chip_point: Number(r[6]) || 0,
+      total_point: Number(r[7]) || 0,
+      rule_snapshot: String(r[8] || ''),
+    }));
+
+  const game_details = getDataRows_(detailsSheet)
+    .filter((r) => String(r[0] || '').trim() !== '')
+    .map((r) => ({
+      session_id: String(r[0]),
+      date: formatDateCell_(r[1], tz),
+      game_number: Number(r[2]) || 0,
+      player_id: String(r[3] || ''),
+      player_name: String(r[4] || ''),
+      wind: String(r[5] || ''),
+      raw_score: Number(r[6]) || 0,
+      rank: Number(r[7]) || 0,
+      is_tobi: toBoolean_(r[8]),
+      tobi_count: Number(r[9]) || 0,
+      is_yakitori: toBoolean_(r[10]),
+      final_point: Number(r[11]) || 0,
+    }));
+
+  const rawSettings = getDataRows_(settingsSheet)
+    .filter((r) => String(r[0] || '').trim() !== '')
+    .map((r) => ({
+      setting_key: String(r[0]).trim(),
+      setting_value: String(r[1] === null || r[1] === undefined ? '' : r[1]),
+      updated_at: formatDateTimeCell_(r[2], tz),
+    }));
+
+  // 欠損キーがある場合はデフォルト値で補完
+  const settingsMap = {};
+  rawSettings.forEach((row) => {
+    settingsMap[row.setting_key] = row;
+  });
+  const now = formatNow_(tz);
+  const settings = [];
+  DEFAULT_SETTINGS.forEach((def) => {
+    if (settingsMap[def.setting_key]) {
+      settings.push(settingsMap[def.setting_key]);
+      delete settingsMap[def.setting_key];
+    } else {
+      settings.push({
+        setting_key: def.setting_key,
+        setting_value: def.setting_value,
+        updated_at: now,
+      });
+    }
+  });
+  Object.keys(settingsMap).forEach((k) => {
+    settings.push(settingsMap[k]);
+  });
+
+  return { players, daily_records, game_details, settings };
+}
+
+function saveSettings_(ss, incomingSettings) {
+  const tz = ss.getSpreadsheetTimeZone();
+  const now = formatNow_(tz);
+  const sheet = getSheetOrThrow_(ss, SHEET_NAMES.SETTINGS);
+  const existingRows = getDataRows_(sheet);
+
+  const rowMap = {};
+  const orderedKeys = [];
+  existingRows.forEach((r) => {
+    const key = String(r[0] || '').trim();
+    if (!key) return;
+    rowMap[key] = {
+      setting_key: key,
+      setting_value: String(r[1] === null || r[1] === undefined ? '' : r[1]),
+      updated_at: formatDateTimeCell_(r[2], tz),
+    };
+    orderedKeys.push(key);
+  });
+
+  (incomingSettings || []).forEach((item) => {
+    const key = String(item.setting_key || '').trim();
+    if (!key) return;
+    if (!rowMap[key]) {
+      orderedKeys.push(key);
+    }
+    rowMap[key] = {
+      setting_key: key,
+      setting_value: String(
+        item.setting_value === null || item.setting_value === undefined
+          ? ''
+          : item.setting_value
+      ),
+      updated_at: now,
+    };
+  });
+
+  const values = orderedKeys.map((k) => [
+    rowMap[k].setting_key,
+    rowMap[k].setting_value,
+    rowMap[k].updated_at,
+  ]);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, 3).clearContent();
+  }
+  if (values.length > 0) {
+    sheet.getRange(2, 1, values.length, 3).setNumberFormat('@');
+    sheet.getRange(2, 1, values.length, 3).setValues(values);
+  }
+
+  return orderedKeys.map((k) => rowMap[k]);
+}
+
+function savePlayers_(ss, incomingPlayers) {
+  const tz = ss.getSpreadsheetTimeZone();
+  const now = formatNow_(tz);
+  const sheet = getSheetOrThrow_(ss, SHEET_NAMES.PLAYERS);
+  const existingRows = getDataRows_(sheet);
+
+  const players = [];
+  const byId = {};
+  let maxNum = 0;
+
+  existingRows.forEach((r) => {
+    const pid = String(r[0] || '').trim();
+    if (!pid) return;
+    const match = /^P(\d+)$/.exec(pid);
+    if (match) {
+      maxNum = Math.max(maxNum, Number(match[1]));
+    }
+    const obj = {
+      player_id: pid,
+      name: String(r[1] || ''),
+      is_active: toBoolean_(r[2]),
+      created_at: formatDateTimeCell_(r[3], tz),
+    };
+    players.push(obj);
+    byId[pid] = obj;
+  });
+
+  (incomingPlayers || []).forEach((item) => {
+    const pid = String(item.player_id || '').trim();
+    const name = String(item.name || '').trim();
+    const isActive = item.is_active !== false;
+
+    if (!name) {
+      throw new Error('対局者名が空です。');
+    }
+
+    const dup = players.find((p) => p.name === name && p.player_id !== pid);
+    if (dup) {
+      throw new Error(
+        dup.is_active
+          ? '同じ名前の対局者がすでに登録されています: ' + name
+          : '論理削除済みの対局者と同じ名前は登録できません: ' + name
+      );
+    }
+
+    if (!pid) {
+      maxNum += 1;
+      const newId = 'P' + String(maxNum).padStart(3, '0');
+      const created = {
+        player_id: newId,
+        name: name,
+        is_active: isActive,
+        created_at: now,
+      };
+      players.push(created);
+      byId[newId] = created;
+    } else if (byId[pid]) {
+      byId[pid].name = name;
+      byId[pid].is_active = isActive;
+    } else {
+      throw new Error('対象の対局者IDが見つかりません: ' + pid);
+    }
+  });
+
+  const values = players.map((p) => [
+    p.player_id,
+    p.name,
+    p.is_active,
+    p.created_at,
+  ]);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, 4).clearContent();
+  }
+  if (values.length > 0) {
+    sheet.getRange(2, 1, values.length, 1).setNumberFormat('@');
+    sheet.getRange(2, 2, values.length, 1).setNumberFormat('@');
+    sheet.getRange(2, 4, values.length, 1).setNumberFormat('@');
+    sheet.getRange(2, 1, values.length, 4).setValues(values);
+  }
+
+  return players;
+}
+
+function sessionExists_(sheet, sessionId) {
+  const rows = getDataRows_(sheet);
+  const target = String(sessionId || '');
+  return rows.some((r) => String(r[0] || '') === target);
+}
+
+function deleteRowsBySessionId_(sheet, sessionId) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  const target = String(sessionId || '');
+  const ids = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  for (let i = ids.length - 1; i >= 0; i--) {
+    if (String(ids[i][0] || '') === target) {
+      sheet.deleteRow(i + 2);
+    }
+  }
+}
+
+function writeSessionRows_(dailySheet, detailsSheet, payload) {
+  const dailyRecords = (payload.daily_records || []).filter(
+    (r) => !(Number(r.game_count) === 0 && Number(r.chip_diff) === 0)
+  );
+  const gameDetails = payload.game_details || [];
+
+  const dailyValues = dailyRecords.map((r) => [
+    String(r.session_id || ''),
+    String(r.date || ''),
+    String(r.player_id || ''),
+    String(r.player_name || ''),
+    Number(r.game_count) || 0,
+    Number(r.chip_diff) || 0,
+    Number(r.chip_point) || 0,
+    Number(r.total_point) || 0,
+    String(r.rule_snapshot || ''),
+  ]);
+
+  const detailValues = gameDetails.map((g) => [
+    String(g.session_id || ''),
+    String(g.date || ''),
+    Number(g.game_number) || 0,
+    String(g.player_id || ''),
+    String(g.player_name || ''),
+    String(g.wind || ''),
+    Number(g.raw_score) || 0,
+    Number(g.rank) || 0,
+    Boolean(g.is_tobi),
+    Number(g.tobi_count) || 0,
+    Boolean(g.is_yakitori),
+    Number(g.final_point) || 0,
+  ]);
+
+  // 日付・ID・名前・rule_snapshot は文字列書式（@）で保存
+  appendRowsFormatted_(dailySheet, dailyValues, [1, 2, 3, 4, 9]);
+  appendRowsFormatted_(detailsSheet, detailValues, [1, 2, 4, 5, 6]);
+}
+
+function saveSession_(ss, payload) {
+  const sessionId = String(payload.session_id || '').trim();
+  if (!sessionId) {
+    throw new Error('session_id が指定されていません。');
+  }
+  const dailySheet = getSheetOrThrow_(ss, SHEET_NAMES.DAILY_RECORDS);
+  const detailsSheet = getSheetOrThrow_(ss, SHEET_NAMES.GAME_DETAILS);
+
+  if (
+    sessionExists_(dailySheet, sessionId) ||
+    sessionExists_(detailsSheet, sessionId)
+  ) {
+    return true; // 重複送信時はスキップ
+  }
+
+  writeSessionRows_(dailySheet, detailsSheet, payload);
+  return false;
+}
+
+function updateSession_(ss, payload) {
+  const sessionId = String(payload.session_id || '').trim();
+  if (!sessionId) {
+    throw new Error('session_id が指定されていません。');
+  }
+  const dailySheet = getSheetOrThrow_(ss, SHEET_NAMES.DAILY_RECORDS);
+  const detailsSheet = getSheetOrThrow_(ss, SHEET_NAMES.GAME_DETAILS);
+
+  deleteRowsBySessionId_(dailySheet, sessionId);
+  deleteRowsBySessionId_(detailsSheet, sessionId);
+  writeSessionRows_(dailySheet, detailsSheet, payload);
+}
+
+function deleteSession_(ss, sessionId) {
+  const target = String(sessionId || '').trim();
+  if (!target) {
+    throw new Error('session_id が指定されていません。');
+  }
+  const dailySheet = getSheetOrThrow_(ss, SHEET_NAMES.DAILY_RECORDS);
+  const detailsSheet = getSheetOrThrow_(ss, SHEET_NAMES.GAME_DETAILS);
+
+  deleteRowsBySessionId_(dailySheet, target);
+  deleteRowsBySessionId_(detailsSheet, target);
+}
+===== ここまでコピー =====
+
+(3) 上部の保存アイコン（または Ctrl+S / Macは Cmd+S）を押して保存します。
+
+
+------------------------------------------------------------------------
+3. ウェブアプリとしてデプロイ（公開URLの発行）
+------------------------------------------------------------------------
+(1) Apps Script エディタ右上の「デプロイ」ボタン ＞「新しいデプロイ」
+    をクリックします。
+
+(2) 左上の「種類の選択」横の歯車アイコンをクリックし、
+    「ウェブアプリ」を選択します。
+
+(3) 各項目を以下のように設定します（★重要）。
+    ・説明　　　　　　　：v1.0 初回デプロイ（任意）
+    ・次のユーザーとして実行：自分
+    ・アクセスできるユーザー：全員
+      ※「全員（Googleアカウント保有者のみ）」や「自分のみ」にすると、
+        iPad Safari等からCORS通信ができず接続エラーになります。
+        必ず一番下の「全員」を選択してください。
+
+(4) 「デプロイ」ボタンをクリックします。
+
+(5) 初回のみ「アクセスを承認」ダイアログが表示されるため、
+    以下の手順で権限を許可します。
+    1.「アクセスを承認」をクリックし、自身のGoogleアカウントを選択
+    2.「このアプリはGoogleで確認されていません」と表示された場合：
+       左下の「詳細」をクリック ＞ 一番下の
+       「〇〇（安全ではないページ）に移動」をクリック
+    3. 内容を確認し「許可」をクリック
+
+(6) デプロイ完了画面に表示される「ウェブアプリ」の URL をコピーします。
+    形式：https://script.google.com/macros/s/〇〇〇/exec
+    ※「/dev」で終わるテストデプロイURLは使用できません。
+      必ず「/exec」で終わる本番URLを使用してください。
+
+
+------------------------------------------------------------------------
+4. アプリとの接続テスト・iPad Safari への登録
+------------------------------------------------------------------------
+(1) 麻雀成績管理アプリを開き、「接続設定」画面にコピーした
+    GAS WebアプリURL（末尾 /exec）を貼り付けます。
+
+(2) 「接続テスト」ボタンを押し、
+    「接続テスト成功（APIバージョン: v1.0）」が表示されることを確認します。
+
+(3) 「保存して開始」をクリックすると、スプレッドシートのデータが
+    読み込まれ、利用を開始できます。
+
+(4) 【グループ共有・iPad Safari（ホーム画面追加）の手順】
+    ・接続設定画面の「設定済みリンクをコピー」を押すと、
+      「?gasUrl=...」付きの共有用URLを取得できます。
+    ・iPad Safari では通常ブラウザと「ホーム画面に追加」したアプリで
+      保存領域（localStorage）が別々に管理されるため、必ず
+      「?gasUrl=...」付きのURLを Safari で開いた状態から
+      共有ボタン ＞「ホーム画面に追加」を行ってください。
+    ・これにより、7日間未使用でSafariの保存情報が消去された場合も、
+      ホーム画面アイコンや共有リンクから再入力なしで自動復帰できます。
+
+
+------------------------------------------------------------------------
+5. GASコード修正時の再デプロイ注意点（重要）
+------------------------------------------------------------------------
+後日、Apps Script 上で「コード.gs」を修正して保存しただけでは、
+公開済みの「/exec」URLには修正内容が反映されません。
+
+・同じURLのまま更新する場合：
+  1. エディタ右上「デプロイ」＞「デプロイを管理」をクリック
+  2. 右上の鉛筆アイコン（編集）をクリック
+  3. バージョン欄を「新バージョン」に変更（※重要）
+  4.「デプロイ」をクリック
+
+※バージョンを「新バージョン」にせず更新すると古いコードが動き続けます。
+※誤って「新しいデプロイ」を実行すると別の「/exec」URLが発行されるため、
+  メンバー全員へURLを再共有する必要が生じます。
+
+
+------------------------------------------------------------------------
+6. テンプレート配布（/copy リンク作成）の方法と注意点
+------------------------------------------------------------------------
+他のグループや別アカウント向けに「空の完成済みテンプレート」を
+配布したい場合は、以下の手順で行います。
+
+■ 6-1. 配布前のクリーンアップ
+  ・テスト接続や動作確認を行った場合は、テンプレート用の
+    「Players」「DailyRecords」「GameDetails」の2行目以降を削除し、
+    1行目（ヘッダー）のみの状態に戻してください。
+  ・「Settings」シートには1行目（ヘッダー）と2〜13行目（初期値12行）
+    が入ったままにしてください。
+  ・Apps Script 側で「コード.gs」が保存済みであることを確認してください。
+
+■ 6-2. 共有設定と /copy URL の作成
+  (1) スプレッドシート右上の「共有」ボタンをクリックします。
+  (2)「一般的なアクセス」を「制限付き」から
+      「リンクを知っている全員」に変更し、権限が「閲覧者」であることを
+      確認します（※「編集者」にしないでください）。
+  (3)「リンクをコピー」をクリックします。
+      例：https://docs.google.com/spreadsheets/d/SHEET_ID/edit?usp=sharing
+  (4) URL末尾の「/edit...」以降を「/copy」に書き換えて配布します。
+      例：https://docs.google.com/spreadsheets/d/SHEET_ID/copy
+
+■ 6-3. テンプレートを受け取った側の手順（配布先への案内）
+  ・配布された「/copy」リンクを開き「コピーを作成」すると、
+    スプレッドシート本体と一緒に「コード.gs」もコピーされます。
+  ・ただし、Webアプリとしてのデプロイ状態はコピーされないため、
+    受け取った側が各自で上記「3. ウェブアプリとしてデプロイ」を実施し、
+    発行された自分専用の「/exec」URLをアプリへ設定する必要があります。
+    （これにより、配布元のスプレッドシートへデータが混入せず、
+      各自のGoogleドライブ上で完全に独立してデータを管理できます）
+
+
+------------------------------------------------------------------------
+7. セキュリティ・運用上の注意点
+------------------------------------------------------------------------
+(1) 共有URL（/exec および ?gasUrl=...）の取り扱い
+    ・本構成は限定メンバー間の利用を想定しており、API呼び出し時の
+      パスコード認証は設けていません。
+    ・そのため、GAS URLを知っている第三者はAPI経由でデータの
+      閲覧・改ざん・削除が可能になります。
+    ・SNS・ブログ・公開掲示板・公開GitHubリポジトリ等、不特定多数が
+      閲覧できる場所に「/exec」URLや「?gasUrl=...」リンクを
+      絶対に掲載しないでください。
+
+(2) URL流出時やメンバー離脱時のアクセス遮断方法
+    ・万が一URLが外部へ漏れた場合や、元メンバーのアクセスを
+      止めたい場合は、以下の手順で既存のURLを無効化できます。
+      1. Apps Script「デプロイ」＞「デプロイを管理」を開く
+      2. 漏洩したデプロイを選択し「アーカイブ」を実行（無効化）
+      3.「新しいデプロイ」＞「ウェブアプリ（全員）」で新URLを発行
+      4. 新URLをアプリに設定し、「設定済みリンクをコピー」で
+         現メンバーへ再共有する
+
+========================================================================
+以上
